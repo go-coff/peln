@@ -1,6 +1,6 @@
 # go-coff/pe
 
-Tiny pure-Go appender for PE/COFF sections — the equivalent of
+Pure-Go appender for PE/COFF sections — the equivalent of
 `objcopy --add-section`, restricted to the case that matters for UEFI Unified
 Kernel Images (UKIs): adding new sections at the end of an existing PE32 or
 PE32+ image while leaving every existing section's RVA, file offset and
@@ -84,4 +84,4 @@ minimal) is otherwise painful.
 
 ## License
 
-MIT.
+BSD 3-Clause. See [LICENSE](LICENSE).
