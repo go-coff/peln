@@ -1,0 +1,60 @@
+version: '3'
+
+tasks:
+  default:
+    desc: List available tasks.
+    cmds:
+      - task --list-all
+    silent: true
+
+  fmt:
+    desc: Format Go sources in place.
+    cmds:
+      - gofmt -s -w .
+
+  fmt-check:
+    desc: Fail if any file is not gofmt-clean.
+    cmds:
+      - test -z "$(gofmt -s -l .)"
+
+  vet:
+    desc: Run go vet.
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run tests with the race detector.
+    cmds:
+      - go test -race ./...
+
+  cover:
+    desc: Run tests with coverage and print a per-function summary.
+    cmds:
+      - go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - go tool cover -func=coverage.out
+
+  cover-html:
+    desc: Generate an HTML coverage report at coverage.html.
+    deps: [cover]
+    cmds:
+      - go tool cover -html=coverage.out -o coverage.html
+
+  cover-check:
+    desc: Fail unless statement coverage is 100%.
+    deps: [cover]
+    cmds:
+      - |
+        pct=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d %)
+        awk -v p="$pct" 'BEGIN { if (p+0 < 100.0) { printf "coverage is %s%%, want 100%%\n", p; exit 1 } }'
+
+  tidy:
+    desc: Run go mod tidy.
+    cmds:
+      - go mod tidy
+
+  ci:
+    desc: Run the same checks CI runs.
+    cmds:
+      - task: fmt-check
+      - task: vet
+      - task: cover-check

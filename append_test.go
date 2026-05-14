@@ -40,7 +40,7 @@ func buildMinimalPE(t *testing.T) []byte {
 
 	// COFF File Header.
 	binary.LittleEndian.PutUint16(buf[coffOff+0:], 0x8664) // Machine = AMD64
-	binary.LittleEndian.PutUint16(buf[coffOff+2:], 1)     // NumberOfSections
+	binary.LittleEndian.PutUint16(buf[coffOff+2:], 1)      // NumberOfSections
 	binary.LittleEndian.PutUint16(buf[coffOff+16:], optSize)
 	binary.LittleEndian.PutUint16(buf[coffOff+18:], 0x002E) // Characteristics
 
@@ -57,9 +57,9 @@ func buildMinimalPE(t *testing.T) []byte {
 	secOff := optOff + optSize
 	copy(buf[secOff:secOff+8], []byte(".text"))
 	binary.LittleEndian.PutUint32(buf[secOff+8:], uint32(len(textData))) // VirtualSize
-	binary.LittleEndian.PutUint32(buf[secOff+12:], uint32(textVA))      // VirtualAddress
-	binary.LittleEndian.PutUint32(buf[secOff+16:], textRaw)             // SizeOfRawData
-	binary.LittleEndian.PutUint32(buf[secOff+20:], sizeOfHeaders)       // PointerToRawData
+	binary.LittleEndian.PutUint32(buf[secOff+12:], uint32(textVA))       // VirtualAddress
+	binary.LittleEndian.PutUint32(buf[secOff+16:], textRaw)              // SizeOfRawData
+	binary.LittleEndian.PutUint32(buf[secOff+20:], sizeOfHeaders)        // PointerToRawData
 	binary.LittleEndian.PutUint32(buf[secOff+36:], SCN_CNT_INITIALIZED_DATA|SCN_MEM_READ|SCN_MEM_EXECUTE)
 
 	// .text data.
@@ -331,10 +331,10 @@ func TestAlignUp(t *testing.T) {
 	cases := []struct {
 		v, a, want uint32
 	}{
-		{0, 0, 0},   // align==0 short-circuit
-		{5, 0, 5},   // align==0 short-circuit, non-zero v
-		{8, 4, 8},   // already aligned
-		{5, 4, 8},   // round up
+		{0, 0, 0}, // align==0 short-circuit
+		{5, 0, 5}, // align==0 short-circuit, non-zero v
+		{8, 4, 8}, // already aligned
+		{5, 4, 8}, // round up
 		{16, 16, 16},
 	}
 	for _, c := range cases {
