@@ -1,5 +1,9 @@
 # go-coff/pe
 
+[![CI](https://github.com/go-coff/pe/actions/workflows/ci.yml/badge.svg)](https://github.com/go-coff/pe/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](https://github.com/go-coff/pe/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-coff/pe.svg)](https://pkg.go.dev/github.com/go-coff/pe)
+
 Pure-Go appender for PE/COFF sections — the equivalent of
 `objcopy --add-section`, restricted to the case that matters for UEFI Unified
 Kernel Images (UKIs): adding new sections at the end of an existing PE32 or
