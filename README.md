@@ -13,6 +13,7 @@ Two packages:
 | ------- | ------ | --- |
 | [`linker`](linker) | `github.com/go-coff/peln/linker` | turn relocatable objects (or a PIE) into a PE32+/EFI image — the pure-Go replacement for `lld-link /subsystem:efi_application` |
 | [`appender`](appender) | `github.com/go-coff/peln/appender` | add sections to an existing PE (UKI assembly) — the equivalent of `objcopy --add-section` |
+| [`fwimg`](fwimg) | `github.com/go-coff/peln/fwimg` | **non-UEFI** bare-metal images: ELF→flat binary (`objcopy -O binary`), Motorola SREC, Intel HEX, and U-Boot uImage (`mkimage`) |
 
 A reference CLI lives in [`github.com/go-coff/pectl`](https://github.com/go-coff/pectl).
 
@@ -96,6 +97,28 @@ _ = os.WriteFile("BOOTX64.EFI", out, 0o644)
 
 The stub must reserve enough header padding to absorb the new section-table
 entries (`SizeOfHeaders` is not grown); all systemd UEFI stubs do.
+
+## fwimg — non-UEFI bare-metal images
+
+Not every bare-metal target is UEFI. For images loaded at a fixed address by
+a bootloader or ROM, `fwimg` converts an ELF executable into the relevant
+flat/firmware format, again with no binutils/`mkimage`/`srec_cat`:
+
+```go
+import "github.com/go-coff/peln/fwimg"
+
+elf, _ := os.ReadFile("kernel.elf")
+flat, base, _ := fwimg.Flatten(bytes.NewReader(elf), fwimg.FlattenOptions{}) // objcopy -O binary
+_ = os.WriteFile("kernel.img", flat, 0o644)                                  // e.g. Raspberry Pi
+
+hex := fwimg.IHEX(uint32(base), flat, 0)         // Intel HEX for a flasher
+srec := fwimg.SREC(uint32(base), flat, "fw", 0, 0)
+uimg := fwimg.UImage(flat, fwimg.UImageOptions{  // U-Boot bootm payload
+    Load: 0x80000, Entry: 0x80000, Name: "linux", Arch: fwimg.ArchARM64,
+})
+```
+
+The CLI exposes this as `pectl objcopy -O binary|srec|ihex|uimage`.
 
 ## Why not call binutils / LLD?
 

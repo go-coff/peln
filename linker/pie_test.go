@@ -31,8 +31,10 @@ type pieSpec struct {
 	entry     uint64
 	segs      []segSpec
 	relas     []relaSpec
-	omitRela  bool // don't emit the .rela section at all
-	relaBytes int  // override .rela sh_size (0 = derive 24*len)
+	omitRela  bool     // don't emit the .rela section at all
+	relaBytes int      // override .rela sh_size (0 = derive 24*len)
+	relrs     []uint64 // raw .relr entries (encoded as-is)
+	relrBytes int      // override .relr sh_size (0 = derive 8*len)
 }
 
 // buildPIE assembles a minimal but debug/elf-parsable ELF64 LE image.
@@ -49,6 +51,7 @@ func buildPIE(s pieSpec) []byte {
 		phoff      = 64
 		segDataOff = 0x1000
 		relaOff    = 0x2000
+		relrOff    = 0x2400
 		shstrOff   = 0x2800
 		shoff      = 0x3000
 	)
@@ -95,11 +98,20 @@ func buildPIE(s pieSpec) []byte {
 		relaLen = s.relaBytes
 	}
 
+	// --- .relr content ---
+	relrLen := len(s.relrs) * 8
+	for i, e := range s.relrs {
+		binary.LittleEndian.PutUint64(buf[relrOff+i*8:], e)
+	}
+	if s.relrBytes != 0 {
+		relrLen = s.relrBytes
+	}
+
 	// --- shstrtab ---
-	names := "\x00.text\x00.rela\x00.shstrtab\x00"
+	names := "\x00.text\x00.rela\x00.relr\x00.shstrtab\x00"
 	copy(buf[shstrOff:], names)
 
-	// --- section headers: NULL, .text, [.rela], .shstrtab ---
+	// --- section headers: NULL, .text, [.rela], [.relr], .shstrtab ---
 	type sh struct {
 		name             uint32
 		typ              elf.SectionType
@@ -114,6 +126,9 @@ func buildPIE(s pieSpec) []byte {
 	}
 	if !s.omitRela {
 		shs = append(shs, sh{name: uint32(strings.Index(names, ".rela")), typ: elf.SHT_RELA, off: relaOff, size: uint64(relaLen), entsz: 24, addralign: 8})
+	}
+	if s.relrs != nil || s.relrBytes != 0 {
+		shs = append(shs, sh{name: uint32(strings.Index(names, ".relr")), typ: shtRELR, off: relrOff, size: uint64(relrLen), entsz: 8, addralign: 8})
 	}
 	shs = append(shs, sh{name: uint32(strings.Index(names, ".shstrtab")), typ: elf.SHT_STRTAB, off: shstrOff, size: uint64(len(names)), addralign: 1})
 
@@ -370,6 +385,168 @@ func TestLinkPIE_NoneRelocSkipped(t *testing.T) {
 	rd := p.data(reloc)
 	if entry := binary.LittleEndian.Uint16(rd[8:]); entry != uint16(BaseRelocDir64)<<12|0x20 {
 		t.Errorf("expected single DIR64 at RVA 0x20, got entry 0x%x", entry)
+	}
+}
+
+// --- SHT_RELR (DT_RELR) decoding ----------------------------------------------
+
+// relRVAs decodes the .reloc directory of a converted PE into the set of
+// (DIR64) base-relocation RVAs it carries. The .reloc format is a series of
+// blocks: a uint32 page RVA, a uint32 block byte size, then 2-byte entries
+// whose low 12 bits are an offset within the page and whose top 4 bits are
+// the reloc type.
+func relRVAs(t *testing.T, p peInfo) []uint32 {
+	t.Helper()
+	reloc := p.section(".reloc")
+	if reloc == nil {
+		return nil
+	}
+	rd := p.data(reloc)
+	var rvas []uint32
+	for off := 0; off+8 <= len(rd); {
+		page := binary.LittleEndian.Uint32(rd[off:])
+		size := binary.LittleEndian.Uint32(rd[off+4:])
+		if size < 8 || off+int(size) > len(rd) {
+			break
+		}
+		for e := off + 8; e+2 <= off+int(size); e += 2 {
+			entry := binary.LittleEndian.Uint16(rd[e:])
+			if entry == 0 {
+				continue
+			}
+			if entry>>12 != uint16(BaseRelocDir64) {
+				t.Fatalf("unexpected reloc type %d", entry>>12)
+			}
+			rvas = append(rvas, page+uint32(entry&0xfff))
+		}
+		off += int(size)
+	}
+	return rvas
+}
+
+func hasRVA(rvas []uint32, want uint32) bool {
+	for _, r := range rvas {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}
+
+// A .relr section with an address entry followed by a bitmap entry that sets
+// several bits across the 63-word window. Each selected site must yield a
+// DIR64 base reloc at the matching RVA, and the 8 bytes at each site must be
+// left untouched (RELR carries no addend).
+func TestLinkPIE_RelrAddressAndBitmap(t *testing.T) {
+	s := goodSpec()
+	s.relas = nil // exercise RELR in isolation
+	s.omitRela = true
+	// Pre-seed the link-time absolute VAs RELR must NOT overwrite.
+	// Address entry → site 0x10000 (offset 0x00 in .text).
+	// Bitmap → cursor 0x10008; bits 1,3,8 (entry bits 2,4,9) → offsets
+	// 0x08, 0x18, 0x48.
+	const bitmap = uint64(1) | // marker (bit 0)
+		(1 << 2) | // i=1 → cursor + 1*8 = 0x10010 (offset 0x10)
+		(1 << 4) | // i=3 → cursor + 3*8 = 0x10020 (offset 0x20)
+		(1 << 9) // i=8 → cursor + 8*8 = 0x10048 (offset 0x48)
+	s.relrs = []uint64{0x10000, bitmap}
+	out, err := LinkPIE(bytes.NewReader(buildPIE(s)), PIEOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := parsePE(t, out)
+	rvas := relRVAs(t, p)
+	for _, want := range []uint32{0x00, 0x10, 0x20, 0x48} {
+		if !hasRVA(rvas, want) {
+			t.Errorf("missing DIR64 base reloc at RVA 0x%x (got %v)", want, rvas)
+		}
+	}
+	if len(rvas) != 4 {
+		t.Errorf("got %d base relocs, want 4 (%v)", len(rvas), rvas)
+	}
+	// RELR must not have overwritten the site bytes.
+	text := &p.sections[0]
+	for _, loc := range []int{0x00, 0x10, 0x20, 0x48} {
+		if got := binary.LittleEndian.Uint64(p.data(text)[loc:]); got != 0 {
+			t.Errorf("RELR overwrote site at offset 0x%x: 0x%x", loc, got)
+		}
+	}
+}
+
+// RELA and RELR coexisting must both contribute base relocs.
+func TestLinkPIE_RelaAndRelr(t *testing.T) {
+	s := goodSpec() // one RELA at 0x10010 → RVA 0x10
+	s.relrs = []uint64{0x10020}
+	out, err := LinkPIE(bytes.NewReader(buildPIE(s)), PIEOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := parsePE(t, out)
+	rvas := relRVAs(t, p)
+	if !hasRVA(rvas, 0x10) || !hasRVA(rvas, 0x20) {
+		t.Errorf("expected base relocs at 0x10 (RELA) and 0x20 (RELR), got %v", rvas)
+	}
+	// RELA pre-applied its addend; RELR left its site alone.
+	text := &p.sections[0]
+	if got := binary.LittleEndian.Uint64(p.data(text)[0x10:]); got != 0x10040 {
+		t.Errorf("RELA pre-apply = 0x%x, want 0x10040", got)
+	}
+}
+
+func TestLinkPIE_RelrErrors(t *testing.T) {
+	cases := []struct {
+		name string
+		spec pieSpec
+		want string
+	}{
+		{"relr not multiple of 8", func() pieSpec {
+			s := goodSpec()
+			s.omitRela = true
+			s.relas = nil
+			s.relrs = []uint64{0x10000}
+			s.relrBytes = 7
+			return s
+		}(), "multiple of Elf64_Relr"},
+		{"relr site outside segment", func() pieSpec {
+			s := goodSpec()
+			s.omitRela = true
+			s.relas = nil
+			s.relrs = []uint64{0x99990} // even → address entry, no segment
+			return s
+		}(), "outside any loadable segment"},
+		{"relr site crosses section end", func() pieSpec {
+			s := goodSpec()
+			s.omitRela = true
+			s.relas = nil
+			s.relrs = []uint64{0x100fc} // 8-byte span runs past data end 0x10100
+			return s
+		}(), "crosses the end"},
+		{"relr bitmap site outside segment", func() pieSpec {
+			s := goodSpec()
+			s.omitRela = true
+			s.relas = nil
+			// Anchor in-segment, then a bitmap whose top bit selects a far
+			// site (cursor 0x10008 + 62*8 = 0x101f8, past the 0x100 data),
+			// exercising the bitmap branch's emit error path.
+			s.relrs = []uint64{0x10000, uint64(1) | (1 << 63)}
+			return s
+		}(), "outside any loadable segment"},
+		{"relr data read error", func() pieSpec {
+			s := goodSpec()
+			s.omitRela = true
+			s.relas = nil
+			s.relrs = []uint64{0x10000}
+			s.relrBytes = 0x100000 // sh_size beyond the image → Data() EOFs
+			return s
+		}(), ".relr"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := LinkPIE(bytes.NewReader(buildPIE(c.spec)), PIEOptions{})
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want containing %q", err, c.want)
+			}
+		})
 	}
 }
 

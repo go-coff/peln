@@ -159,6 +159,11 @@ func pieMachine(m elf.Machine) (peMachine uint16, relType uint32, ok bool) {
 	return 0, 0, false
 }
 
+// shtRELR is SHT_RELR — a section of DT_RELR packed relative relocations.
+// Some releases of debug/elf don't export it as a named constant, so it's
+// defined locally (the on-disk value is fixed by the ELF gABI at 19).
+const shtRELR elf.SectionType = 19
+
 // applyPIERelocs walks every SHT_RELA section, pre-applies each RELATIVE
 // reloc into the segment-backed section data, and returns the DIR64 base
 // relocations. Any non-RELATIVE dynamic relocation is rejected — a
@@ -166,42 +171,117 @@ func pieMachine(m elf.Machine) (peMachine uint16, relType uint32, ok bool) {
 func applyPIERelocs(ef *elf.File, machine uint16, relType uint32, imageBase uint64, out []*MergedSection) ([]BaseReloc, error) {
 	var baseRel []BaseReloc
 	for _, s := range ef.Sections {
-		if s.Type != elf.SHT_RELA {
+		switch s.Type {
+		case elf.SHT_RELA:
+			rels, err := applyPIERela(ef, s, relType, imageBase, out)
+			if err != nil {
+				return nil, err
+			}
+			baseRel = append(baseRel, rels...)
+		case shtRELR:
+			rels, err := applyPIERelr(ef, s, imageBase, out)
+			if err != nil {
+				return nil, err
+			}
+			baseRel = append(baseRel, rels...)
+		}
+	}
+	return baseRel, nil
+}
+
+// applyPIERela handles a single SHT_RELA section: it pre-applies each
+// RELATIVE reloc and returns the matching DIR64 base relocations. Any
+// non-RELATIVE dynamic relocation is rejected.
+func applyPIERela(ef *elf.File, s *elf.Section, relType uint32, imageBase uint64, out []*MergedSection) ([]BaseReloc, error) {
+	data, err := s.Data()
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.Name, err)
+	}
+	if len(data)%24 != 0 {
+		return nil, fmt.Errorf("%s size %d not a multiple of Elf64_Rela (24)", s.Name, len(data))
+	}
+	bo := ef.ByteOrder
+	var baseRel []BaseReloc
+	for off := 0; off < len(data); off += 24 {
+		rOffset := bo.Uint64(data[off:])
+		rInfo := bo.Uint64(data[off+8:])
+		rAddend := int64(bo.Uint64(data[off+16:]))
+		rt := uint32(rInfo & 0xffffffff)
+		if rt == uint32(elf.R_LARCH_NONE) { // 0 across our arches: padding
 			continue
 		}
-		data, err := s.Data()
-		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", s.Name, err)
+		if rt != relType {
+			return nil, fmt.Errorf("%s: unsupported dynamic reloc type %d (only RELATIVE %d is supported for a static PIE)", s.Name, rt, relType)
 		}
-		if len(data)%24 != 0 {
-			return nil, fmt.Errorf("%s size %d not a multiple of Elf64_Rela (24)", s.Name, len(data))
+		sec := sectionForVA(out, imageBase, rOffset)
+		if sec == nil {
+			return nil, fmt.Errorf("RELATIVE reloc offset 0x%x falls outside any loadable segment's file data", rOffset)
 		}
-		bo := ef.ByteOrder
-		for off := 0; off < len(data); off += 24 {
-			rOffset := bo.Uint64(data[off:])
-			rInfo := bo.Uint64(data[off+8:])
-			rAddend := int64(bo.Uint64(data[off+16:]))
-			rt := uint32(rInfo & 0xffffffff)
-			if rt == uint32(elf.R_LARCH_NONE) { // 0 across our arches: padding
-				continue
-			}
-			if rt != relType {
-				return nil, fmt.Errorf("%s: unsupported dynamic reloc type %d (only RELATIVE %d is supported for a static PIE)", s.Name, rt, relType)
-			}
-			sec := sectionForVA(out, imageBase, rOffset)
-			if sec == nil {
-				return nil, fmt.Errorf("RELATIVE reloc offset 0x%x falls outside any loadable segment's file data", rOffset)
-			}
-			loc := rOffset - (imageBase + uint64(sec.RVA))
-			if loc+8 > uint64(len(sec.Data)) {
-				return nil, fmt.Errorf("RELATIVE reloc offset 0x%x crosses the end of section %s", rOffset, sec.Name)
-			}
-			// Store the absolute preferred target VA (== addend); the PE
-			// loader rebases it by (actualBase-ImageBase) via the DIR64
-			// base reloc emitted below.
-			ef.ByteOrder.PutUint64(sec.Data[loc:], uint64(rAddend))
-			baseRel = append(baseRel, BaseReloc{RVA: uint32(rOffset - imageBase), Type: BaseRelocDir64})
+		loc := rOffset - (imageBase + uint64(sec.RVA))
+		if loc+8 > uint64(len(sec.Data)) {
+			return nil, fmt.Errorf("RELATIVE reloc offset 0x%x crosses the end of section %s", rOffset, sec.Name)
 		}
+		// Store the absolute preferred target VA (== addend); the PE
+		// loader rebases it by (actualBase-ImageBase) via the DIR64
+		// base reloc emitted below.
+		bo.PutUint64(sec.Data[loc:], uint64(rAddend))
+		baseRel = append(baseRel, BaseReloc{RVA: uint32(rOffset - imageBase), Type: BaseRelocDir64})
+	}
+	return baseRel, nil
+}
+
+// applyPIERelr decodes a single SHT_RELR (DT_RELR) section into DIR64 base
+// relocations. RELR is a compact encoding of relative relocations: a stream
+// of uint64 entries where an even entry is the address of a relocation site
+// and an odd entry is a bitmap for the 63 words that follow the current
+// cursor. Unlike RELA, RELR carries no addend — the link-time absolute VA is
+// already stored at each site — so the 8 bytes there are left untouched.
+func applyPIERelr(ef *elf.File, s *elf.Section, imageBase uint64, out []*MergedSection) ([]BaseReloc, error) {
+	data, err := s.Data()
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.Name, err)
+	}
+	if len(data)%8 != 0 {
+		return nil, fmt.Errorf("%s size %d not a multiple of Elf64_Relr (8)", s.Name, len(data))
+	}
+	bo := ef.ByteOrder
+	var baseRel []BaseReloc
+	// emit resolves the section for a RELR site, bounds-checks its 8-byte
+	// span (without overwriting it), and appends a DIR64 base reloc.
+	emit := func(site uint64) error {
+		sec := sectionForVA(out, imageBase, site)
+		if sec == nil {
+			return fmt.Errorf("RELR reloc offset 0x%x falls outside any loadable segment's file data", site)
+		}
+		loc := site - (imageBase + uint64(sec.RVA))
+		if loc+8 > uint64(len(sec.Data)) {
+			return fmt.Errorf("RELR reloc offset 0x%x crosses the end of section %s", site, sec.Name)
+		}
+		baseRel = append(baseRel, BaseReloc{RVA: uint32(site - imageBase), Type: BaseRelocDir64})
+		return nil
+	}
+	var where uint64
+	for off := 0; off < len(data); off += 8 {
+		entry := bo.Uint64(data[off:])
+		if entry&1 == 0 {
+			// Address entry: relocate this site, advance past it.
+			where = entry
+			if err := emit(where); err != nil {
+				return nil, err
+			}
+			where += 8
+			continue
+		}
+		// Bitmap entry: bit 0 is the marker; bits 1..63 select the 63
+		// words starting at the cursor.
+		for i := 0; i < 63; i++ {
+			if entry&(1<<uint(i+1)) != 0 {
+				if err := emit(where + uint64(i)*8); err != nil {
+					return nil, err
+				}
+			}
+		}
+		where += 63 * 8
 	}
 	return baseRel, nil
 }
