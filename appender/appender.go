@@ -1,11 +1,14 @@
-// Package pe is a tiny pure-Go appender for sections to a PE32/PE32+
+// Package appender is a tiny pure-Go appender for sections to a PE32/PE32+
 // image. It is the equivalent of `objcopy --add-section`, restricted to the
 // case that matters for UEFI Unified Kernel Images: appending new sections
 // at the end of the file, leaving every existing section's RVA, file offset
 // and data untouched.
 //
 // The package only depends on the standard library and is intentionally
-// small so it can be vendored or audited in one sitting.
+// small so it can be vendored or audited in one sitting. It is the
+// companion to [github.com/go-coff/peln/linker]; together they cover the
+// two PE assembly modes the cloud-boot toolchain needs (append sections
+// to an existing PE, vs. link .o files into a fresh PE).
 //
 // References:
 //   - Microsoft PE/COFF specification rev 11+
@@ -21,7 +24,7 @@
 //     and recomputing requires the full PE checksum algorithm. Tools that
 //     need a valid checksum (e.g. Secure Boot signers) should run their own
 //     pass afterwards.
-package pe
+package appender
 
 import (
 	"encoding/binary"
