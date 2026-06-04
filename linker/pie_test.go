@@ -259,6 +259,33 @@ func TestLinkPIE_Success(t *testing.T) {
 	}
 }
 
+// Two PT_LOAD segments supplied in descending vaddr order force the
+// segment sort (sort.Slice less-func) to actually reorder them — a path a
+// single-segment image never exercises.
+func TestLinkPIE_MultiSegment(t *testing.T) {
+	s := pieSpec{
+		entry: 0x10000,
+		segs: []segSpec{
+			// higher vaddr first → the sort must move it after the lower one
+			{vaddr: 0x11000, off: 0x1200, filesz: 0x100, memsz: 0x100, flags: elf.PF_R | elf.PF_W},
+			{vaddr: 0x10000, off: 0x1000, filesz: 0x100, memsz: 0x100, flags: elf.PF_R | elf.PF_X},
+		},
+		relas: []relaSpec{{off: 0x10010, typ: uint32(elf.R_LARCH_RELATIVE), addend: 0x10040}},
+	}
+	out, err := LinkPIE(bytes.NewReader(buildPIE(s)), PIEOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := parsePE(t, out)
+	if p.imageBase != 0x10000 {
+		t.Errorf("ImageBase = 0x%x, want 0x10000 (lowest segment)", p.imageBase)
+	}
+	// Both loadable segments map to PE sections, in ascending RVA order.
+	if p.sections[0].rva != 0 || p.sections[1].rva != 0x1000 {
+		t.Errorf("section RVAs = 0x%x,0x%x, want 0x0,0x1000", p.sections[0].rva, p.sections[1].rva)
+	}
+}
+
 // --- option defaults & explicit ImageBase ------------------------------------
 
 func TestLinkPIE_ExplicitImageBase(t *testing.T) {
