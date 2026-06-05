@@ -242,11 +242,11 @@ func TestLinkPIE_Success(t *testing.T) {
 	if p.machine != MachineLoongArch64 {
 		t.Errorf("machine = 0x%x, want 0x%x", p.machine, MachineLoongArch64)
 	}
-	if p.imageBase != 0x10000 {
-		t.Errorf("ImageBase = 0x%x, want 0x10000", p.imageBase)
+	if p.imageBase != 0xf000 { // vaddr0 0x10000 - SectionAlignment 0x1000
+		t.Errorf("ImageBase = 0x%x, want 0xf000", p.imageBase)
 	}
-	if p.entryRVA != 0 { // entry 0x10000 - ImageBase 0x10000
-		t.Errorf("entry RVA = 0x%x, want 0", p.entryRVA)
+	if p.entryRVA != 0x1000 { // entry 0x10000 - ImageBase 0xf000
+		t.Errorf("entry RVA = 0x%x, want 0x1000", p.entryRVA)
 	}
 	if p.subsystem != 10 {
 		t.Errorf("Subsystem = %d, want 10", p.subsystem)
@@ -266,8 +266,8 @@ func TestLinkPIE_Success(t *testing.T) {
 	}
 	// .reloc block: page RVA 0 + one DIR64 entry at offset 0x10.
 	rd := p.data(reloc)
-	if page := binary.LittleEndian.Uint32(rd[0:]); page != 0 {
-		t.Errorf("reloc page = 0x%x, want 0", page)
+	if page := binary.LittleEndian.Uint32(rd[0:]); page != 0x1000 {
+		t.Errorf("reloc page = 0x%x, want 0x1000", page)
 	}
 	if entry := binary.LittleEndian.Uint16(rd[8:]); entry != uint16(BaseRelocDir64)<<12|0x10 {
 		t.Errorf("reloc entry = 0x%x, want 0x%x", entry, uint16(BaseRelocDir64)<<12|0x10)
@@ -292,12 +292,55 @@ func TestLinkPIE_MultiSegment(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := parsePE(t, out)
-	if p.imageBase != 0x10000 {
-		t.Errorf("ImageBase = 0x%x, want 0x10000 (lowest segment)", p.imageBase)
+	if p.imageBase != 0xf000 { // lowest segment 0x10000 - SectionAlignment
+		t.Errorf("ImageBase = 0x%x, want 0xf000 (lowest segment - alignment)", p.imageBase)
 	}
-	// Both loadable segments map to PE sections, in ascending RVA order.
-	if p.sections[0].rva != 0 || p.sections[1].rva != 0x1000 {
-		t.Errorf("section RVAs = 0x%x,0x%x, want 0x0,0x1000", p.sections[0].rva, p.sections[1].rva)
+	// Both loadable segments map to PE sections, in ascending RVA order;
+	// the first lands at SectionAlignment (0x1000), after the headers.
+	if p.sections[0].rva != 0x1000 || p.sections[1].rva != 0x2000 {
+		t.Errorf("section RVAs = 0x%x,0x%x, want 0x1000,0x2000", p.sections[0].rva, p.sections[1].rva)
+	}
+}
+
+// Regression: the appended .reloc section adds one more section-table
+// entry than the segment loop accounted for. If the header reservation
+// ignores it, the first segment's file offset is computed too low and the
+// (now larger) section table overruns the first section's raw data —
+// corrupting the image (and clobbering .reloc's own Characteristics field),
+// which UEFI firmware rejects with EFI_UNSUPPORTED. This was latent until a
+// real PE load on EDK2/OVMF; loong64 had only ever been booted via QEMU
+// -kernel, never loaded as a PE.
+func TestLinkPIE_HeaderReserveNoOverlap(t *testing.T) {
+	out, err := LinkPIE(bytes.NewReader(buildPIE(goodSpec())), PIEOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := parsePE(t, out)
+
+	// SizeOfHeaders (optional header +60) must not exceed the first
+	// section's file offset — otherwise headers and section data overlap.
+	lf := binary.LittleEndian.Uint32(p.raw[0x3c:])
+	opt := int(lf) + 4 + 20
+	sizeOfHeaders := binary.LittleEndian.Uint32(p.raw[opt+60:])
+	first := p.sections[0]
+	if first.fileOff < sizeOfHeaders {
+		t.Errorf("first section file offset 0x%x < SizeOfHeaders 0x%x: headers overlap section data",
+			first.fileOff, sizeOfHeaders)
+	}
+	// The headers must also not overrun in memory: the first section starts
+	// at SectionAlignment, leaving [0, SectionAlignment) for the headers.
+	if first.rva != 0x1000 {
+		t.Errorf("first section RVA = 0x%x, want 0x1000 (headers reserved below it)", first.rva)
+	}
+	// .reloc characteristics must survive intact (the overlap used to zero
+	// this field by writing .text data over the section header).
+	reloc := p.section(".reloc")
+	if reloc == nil {
+		t.Fatal("no .reloc section emitted")
+	}
+	const want = scnCntInitializedData | scnMemRead | scnMemDiscardable
+	if reloc.characteristics != want {
+		t.Errorf(".reloc characteristics = 0x%08x, want 0x%08x", reloc.characteristics, want)
 	}
 }
 
@@ -346,10 +389,24 @@ func TestLinkPIE_Errors(t *testing.T) {
 		}(), PIEOptions{}, "crosses the end"},
 		{"unaligned segment vaddr", func() pieSpec {
 			s := goodSpec()
-			s.segs[0].vaddr = 0x10040 // ImageBase floors to 0x10000 → RVA 0x40, not 0x1000-aligned
+			s.segs[0].vaddr = 0x10040
 			s.entry = 0x10040
 			return s
-		}(), PIEOptions{}, "not 0x1000-aligned"},
+			// explicit ImageBase 0x10000 → RVA 0x40, not 0x1000-aligned
+			// (the default ImageBase would instead anchor the first segment
+			// at RVA == SectionAlignment, which is always aligned).
+		}(), PIEOptions{ImageBase: 0x10000}, "not 0x1000-aligned"},
+		{"vaddr below alignment", func() pieSpec {
+			// Default ImageBase = vaddr0 - SectionAlignment would underflow
+			// when the lowest segment sits below SectionAlignment; LinkPIE
+			// must reject it rather than wrap around.
+			s := goodSpec()
+			s.segs = []segSpec{{vaddr: 0x800, off: 0x1000, filesz: 0x100, memsz: 0x100, flags: elf.PF_R | elf.PF_X}}
+			s.entry = 0x800
+			s.relas = nil
+			s.omitRela = true
+			return s
+		}(), PIEOptions{}, "below SectionAlignment"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -456,7 +513,9 @@ func TestLinkPIE_RelrAddressAndBitmap(t *testing.T) {
 	}
 	p := parsePE(t, out)
 	rvas := relRVAs(t, p)
-	for _, want := range []uint32{0x00, 0x10, 0x20, 0x48} {
+	// ImageBase = 0xf000 (vaddr0 - SectionAlignment), so each site VA maps
+	// to RVA = VA - 0xf000: 0x10000→0x1000, +0x10/+0x20/+0x48.
+	for _, want := range []uint32{0x1000, 0x1010, 0x1020, 0x1048} {
 		if !hasRVA(rvas, want) {
 			t.Errorf("missing DIR64 base reloc at RVA 0x%x (got %v)", want, rvas)
 		}
@@ -483,8 +542,9 @@ func TestLinkPIE_RelaAndRelr(t *testing.T) {
 	}
 	p := parsePE(t, out)
 	rvas := relRVAs(t, p)
-	if !hasRVA(rvas, 0x10) || !hasRVA(rvas, 0x20) {
-		t.Errorf("expected base relocs at 0x10 (RELA) and 0x20 (RELR), got %v", rvas)
+	// ImageBase = 0xf000: RELA site 0x10010→RVA 0x1010, RELR 0x10020→0x1020.
+	if !hasRVA(rvas, 0x1010) || !hasRVA(rvas, 0x1020) {
+		t.Errorf("expected base relocs at 0x1010 (RELA) and 0x1020 (RELR), got %v", rvas)
 	}
 	// RELA pre-applied its addend; RELR left its site alone.
 	text := &p.sections[0]

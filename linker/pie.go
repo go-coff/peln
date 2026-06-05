@@ -71,10 +71,19 @@ func LinkPIE(r io.ReaderAt, opts PIEOptions) ([]byte, error) {
 	}
 	sort.Slice(loads, func(i, j int) bool { return loads[i].Vaddr < loads[j].Vaddr })
 
-	// ImageBase defaults to the lowest segment vaddr floored to 64 KiB so
-	// every page-aligned p_vaddr yields a SectionAlignment-aligned RVA.
+	// ImageBase defaults so the lowest PT_LOAD lands at RVA ==
+	// SectionAlignment, reserving [0, SectionAlignment) for the PE headers.
+	// Flooring to 64 KiB instead (the old default) makes the first segment's
+	// RVA == p_vaddr-ImageBase == 0 whenever p_vaddr is itself 64 KiB
+	// aligned (e.g. TamaGo links amd64 text at 0x400000): a segment at RVA 0
+	// overlaps the headers and UEFI firmware rejects the image with
+	// EFI_UNSUPPORTED. Anchoring on SectionAlignment keeps the
+	// RVA == p_vaddr-ImageBase invariant that the relocation pass relies on.
 	if opts.ImageBase == 0 {
-		opts.ImageBase = loads[0].Vaddr &^ 0xffff
+		if loads[0].Vaddr < uint64(opts.SectionAlignment) {
+			return nil, fmt.Errorf("first segment vaddr 0x%x below SectionAlignment 0x%x; pass an explicit ImageBase", loads[0].Vaddr, opts.SectionAlignment)
+		}
+		opts.ImageBase = loads[0].Vaddr - uint64(opts.SectionAlignment)
 	}
 	if loads[0].Vaddr < opts.ImageBase {
 		return nil, fmt.Errorf("ImageBase 0x%x is above the first segment vaddr 0x%x", opts.ImageBase, loads[0].Vaddr)
@@ -83,7 +92,13 @@ func LinkPIE(r io.ReaderAt, opts PIEOptions) ([]byte, error) {
 	// Build one PE section per PT_LOAD, preserving the ELF memory layout
 	// (RVA == p_vaddr-ImageBase) so internal pointers and relocations stay
 	// valid. File offsets are assigned sequentially after the headers.
-	headerTotal := 0x40 + 4 + 20 + 240 + 40*len(loads)
+	//
+	// Reserve a section-table slot for the .reloc section appended later
+	// (len(loads)+1): otherwise the first segment's file offset is computed
+	// for one fewer section header, and once .reloc is added emitPE derives a
+	// larger SizeOfHeaders whose section table overruns the first section's
+	// raw data — corrupting the image so UEFI rejects it (EFI_UNSUPPORTED).
+	headerTotal := 0x40 + 4 + 20 + 240 + 40*(len(loads)+1)
 	foff := alignUp(uint32(headerTotal), opts.FileAlignment)
 	out := make([]*MergedSection, 0, len(loads))
 	for i, p := range loads {
