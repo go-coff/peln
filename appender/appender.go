@@ -58,6 +58,43 @@ type Section struct {
 // Returns an error if the section table cannot grow inside SizeOfHeaders,
 // or if any input field is malformed.
 func Append(stub []byte, sections []Section) ([]byte, error) {
+	return appendCore(stub, sections, "")
+}
+
+// AppendBefore is like [Append], but inserts the new section-table entries
+// immediately before the entry named `beforeName` (rather than at the end of
+// the table). The raw bodies of the new sections still go at the end of the
+// file, with VirtualAddresses past every existing section — so the on-disk
+// VA layout is identical to what [Append] produces. Only the section-header
+// ORDER changes.
+//
+// Why this exists: some firmware PE loaders (notably parts of EDK2's DXE
+// pipeline that hand off via the relocation directory) walk the section
+// table in declared order and stop iterating once they have applied the
+// relocation pass. Placing application sections (e.g. a self-extracting
+// stub's `.payload`) AFTER `.reloc` causes those loaders to never copy the
+// section's raw bytes into memory, even though the section header itself
+// is present. Inserting before `.reloc` puts the new headers ahead of the
+// loader's relocation cutoff while preserving the section's body at the
+// usual end-of-file location.
+//
+// If `beforeName` is empty, AppendBefore behaves like Append. If the named
+// section is not found, an error is returned and the input is unchanged.
+func AppendBefore(stub []byte, beforeName string, sections []Section) ([]byte, error) {
+	if beforeName == "" {
+		return appendCore(stub, sections, "")
+	}
+	return appendCore(stub, sections, beforeName)
+}
+
+// appendCore is the shared implementation behind Append and AppendBefore.
+// When insertBefore is empty, new section headers go after the last existing
+// entry. Otherwise, new headers go immediately before the entry whose name
+// matches insertBefore (the named section's header — and every header after
+// it — slides forward by len(sections)*40 bytes within the section table).
+// In every case the new sections' raw data is placed at the end of the file
+// with VAs past every existing section.
+func appendCore(stub []byte, sections []Section, insertBefore string) ([]byte, error) {
 	if len(stub) < 0x40 {
 		return nil, fmt.Errorf("pe: input too short (%d bytes)", len(stub))
 	}
@@ -84,6 +121,22 @@ func Append(stub []byte, sections []Section) ([]byte, error) {
 		return nil, fmt.Errorf(
 			"pe: section table would overflow SizeOfHeaders (need %d, available %d)",
 			secTableEndNew, pf.sizeOfHeaders)
+	}
+
+	// Resolve the insertion point inside the existing section table. -1 means
+	// "append at the end" (the Append-style behaviour).
+	insertAt := -1
+	if insertBefore != "" {
+		for i := 0; i < int(pf.numSections); i++ {
+			off := secTableStart + i*40
+			if sectionName(stub[off:off+8]) == insertBefore {
+				insertAt = i
+				break
+			}
+		}
+		if insertAt < 0 {
+			return nil, fmt.Errorf("pe: section %q not found", insertBefore)
+		}
 	}
 
 	// Compute the next-available VirtualAddress and PointerToRawData.
@@ -154,8 +207,23 @@ func Append(stub []byte, sections []Section) ([]byte, error) {
 	// CheckSum — zero it (UEFI doesn't enforce it).
 	binary.LittleEndian.PutUint32(out[pf.optOff+64:], 0)
 
-	// Insert the new section headers into the section table.
-	copy(out[secTableEndCurrent:], newHeaders)
+	// Place the new section headers inside the section table. If insertAt < 0
+	// (= Append-style), append after the last existing entry. Otherwise, slide
+	// the entries at and after insertAt forward by len(sections)*40 bytes, and
+	// drop the new headers into the gap.
+	if insertAt < 0 {
+		copy(out[secTableEndCurrent:], newHeaders)
+	} else {
+		insertOff := secTableStart + insertAt*40
+		gap := len(sections) * 40
+		// Shift existing entries [insertOff, secTableEndCurrent) forward.
+		// Using copy on overlapping regions: dst > src, so iterate from the
+		// tail. We have the original bytes in `stub` so just re-emit them
+		// at their new positions.
+		copy(out[insertOff+gap:], stub[insertOff:secTableEndCurrent])
+		// Write the new headers in the freed gap.
+		copy(out[insertOff:], newHeaders)
+	}
 
 	// Pad/truncate the body to nextFile (where the first appended section
 	// starts) and append the new section data.
@@ -168,6 +236,18 @@ func Append(stub []byte, sections []Section) ([]byte, error) {
 	}
 	out = append(out, appended...)
 	return out, nil
+}
+
+// sectionName trims the trailing NUL bytes from an 8-byte PE section-name
+// slot. PE section names are NUL-padded, not NUL-terminated, so a name that
+// fills all 8 bytes has no trailing NULs.
+func sectionName(raw []byte) string {
+	for i, c := range raw {
+		if c == 0 {
+			return string(raw[:i])
+		}
+	}
+	return string(raw)
 }
 
 // parsedPE is the small subset of fields we need to add sections.

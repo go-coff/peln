@@ -327,6 +327,171 @@ func TestAppend_TrailingJunkTruncated(t *testing.T) {
 	}
 }
 
+// buildPEWithSections constructs a minimal PE32+ image carrying exactly the
+// named sections (in the given order). Each section's body is a fixed pattern
+// so the helper can also verify body preservation after Append/AppendBefore.
+// It exists so the AppendBefore tests don't depend on the single-.text
+// buildMinimalPE — they need a stub that already has a `.reloc` to insert
+// before.
+func buildPEWithSections(t *testing.T, names []string) []byte {
+	t.Helper()
+
+	const (
+		dosSize       = 0x40
+		optSize       = 240
+		secTableSlots = 8
+		fileAlign     = uint32(512)
+		sectionAlign  = uint32(0x1000)
+	)
+	headerEnd := dosSize + 4 + 20 + optSize + secTableSlots*40
+	sizeOfHeaders := alignUp(uint32(headerEnd), fileAlign)
+
+	// Each section's raw data is 16 bytes (pattern = first byte of name * 16).
+	const secVS = uint32(16)
+	secRS := alignUp(secVS, fileAlign)
+
+	body := make([]byte, 0, int(secRS)*len(names))
+	for _, n := range names {
+		pad := bytes.Repeat([]byte{n[1]}, int(secVS)) // names start with '.'
+		buf := make([]byte, secRS)
+		copy(buf, pad)
+		body = append(body, buf...)
+	}
+
+	buf := make([]byte, sizeOfHeaders+uint32(len(body)))
+	buf[0] = 'M'
+	buf[1] = 'Z'
+	binary.LittleEndian.PutUint32(buf[0x3C:], dosSize)
+	copy(buf[dosSize:dosSize+4], []byte("PE\x00\x00"))
+
+	coffOff := dosSize + 4
+	binary.LittleEndian.PutUint16(buf[coffOff+0:], 0x8664)
+	binary.LittleEndian.PutUint16(buf[coffOff+2:], uint16(len(names)))
+	binary.LittleEndian.PutUint16(buf[coffOff+16:], optSize)
+	binary.LittleEndian.PutUint16(buf[coffOff+18:], 0x002E)
+
+	optOff := coffOff + 20
+	binary.LittleEndian.PutUint16(buf[optOff+0:], 0x020B)
+	binary.LittleEndian.PutUint32(buf[optOff+32:], sectionAlign)
+	binary.LittleEndian.PutUint32(buf[optOff+36:], fileAlign)
+	binary.LittleEndian.PutUint32(buf[optOff+108:], 16)
+
+	maxVA := uint32(0)
+	for i, n := range names {
+		secOff := optOff + optSize + i*40
+		copy(buf[secOff:secOff+8], n)
+		va := sectionAlign + uint32(i)*sectionAlign
+		binary.LittleEndian.PutUint32(buf[secOff+8:], secVS)
+		binary.LittleEndian.PutUint32(buf[secOff+12:], va)
+		binary.LittleEndian.PutUint32(buf[secOff+16:], secRS)
+		binary.LittleEndian.PutUint32(buf[secOff+20:], sizeOfHeaders+uint32(i)*secRS)
+		binary.LittleEndian.PutUint32(buf[secOff+36:], SCN_CNT_INITIALIZED_DATA|SCN_MEM_READ)
+		if va+secVS > maxVA {
+			maxVA = va + secVS
+		}
+	}
+	binary.LittleEndian.PutUint32(buf[optOff+56:], alignUp(maxVA, sectionAlign))
+	binary.LittleEndian.PutUint32(buf[optOff+60:], sizeOfHeaders)
+
+	copy(buf[sizeOfHeaders:], body)
+	return buf
+}
+
+func TestAppendBefore_InsertsHeaderBeforeNamedSection(t *testing.T) {
+	stub := buildPEWithSections(t, []string{".text", ".rdata", ".data", ".reloc"})
+	out, err := AppendBefore(stub, ".reloc", []Section{
+		{Name: ".payload", Data: []byte("CBP0PAYLOAD_BODY"), Characteristics: DefaultCharacteristics},
+	})
+	if err != nil {
+		t.Fatalf("AppendBefore: %v", err)
+	}
+
+	f, err := pe.NewFile(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("pe.NewFile: %v", err)
+	}
+	defer f.Close()
+
+	gotNames := make([]string, 0, len(f.Sections))
+	for _, s := range f.Sections {
+		gotNames = append(gotNames, s.Name)
+	}
+	wantNames := []string{".text", ".rdata", ".data", ".payload", ".reloc"}
+	if len(gotNames) != len(wantNames) {
+		t.Fatalf("section order = %v, want %v", gotNames, wantNames)
+	}
+	for i := range wantNames {
+		if gotNames[i] != wantNames[i] {
+			t.Fatalf("section[%d] = %q, want %q (full order: %v)", i, gotNames[i], wantNames[i], gotNames)
+		}
+	}
+
+	// Body preservation: the .payload bytes must round-trip.
+	payload, err := f.Sections[3].Data()
+	if err != nil {
+		t.Fatalf("read .payload: %v", err)
+	}
+	if !bytes.HasPrefix(payload, []byte("CBP0PAYLOAD_BODY")) {
+		t.Errorf(".payload body corrupted: %q", payload)
+	}
+
+	// VAs must remain monotonically increasing in section-TABLE order. The
+	// inserted .payload's VA sits at the end of the existing VA range, so
+	// .payload.VA > .reloc.VA — but EDK2-style loaders walk the table in
+	// order and won't care about VA ordering.
+	if f.Sections[3].VirtualAddress <= f.Sections[2].VirtualAddress {
+		t.Errorf(".payload VA (0x%X) should be past .data VA (0x%X)",
+			f.Sections[3].VirtualAddress, f.Sections[2].VirtualAddress)
+	}
+}
+
+func TestAppendBefore_EmptyNameFallsBackToAppend(t *testing.T) {
+	stub := buildPEWithSections(t, []string{".text", ".reloc"})
+	out, err := AppendBefore(stub, "", []Section{
+		{Name: ".payload", Data: []byte("body"), Characteristics: DefaultCharacteristics},
+	})
+	if err != nil {
+		t.Fatalf("AppendBefore: %v", err)
+	}
+	f, err := pe.NewFile(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("pe.NewFile: %v", err)
+	}
+	defer f.Close()
+	if got, want := len(f.Sections), 3; got != want {
+		t.Fatalf("section count = %d, want %d", got, want)
+	}
+	// Empty-name behaviour matches Append (= header at the end of the table).
+	if got, want := f.Sections[2].Name, ".payload"; got != want {
+		t.Errorf("last section = %q, want %q", got, want)
+	}
+}
+
+func TestAppendBefore_UnknownSectionErrors(t *testing.T) {
+	stub := buildPEWithSections(t, []string{".text", ".reloc"})
+	_, err := AppendBefore(stub, ".does_not_exist", []Section{
+		{Name: ".payload", Data: []byte("x"), Characteristics: DefaultCharacteristics},
+	})
+	if err == nil {
+		t.Fatal("expected unknown-section error")
+	}
+}
+
+func TestAppendBefore_RejectsTooShort(t *testing.T) {
+	if _, err := AppendBefore([]byte("MZ"), ".reloc", nil); err == nil {
+		t.Fatal("expected too-short error")
+	}
+}
+
+func TestSectionName_FullEightBytes(t *testing.T) {
+	// A name that fills all 8 bytes has no trailing NUL, exercising the
+	// "no NUL found" return path of sectionName.
+	full := []byte("12345678")
+	if got, want := sectionName(full), "12345678"; got != want {
+		t.Errorf("sectionName(%q) = %q, want %q", full, got, want)
+	}
+}
+
 func TestAlignUp(t *testing.T) {
 	cases := []struct {
 		v, a, want uint32
