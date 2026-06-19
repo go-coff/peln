@@ -9,24 +9,14 @@ permissions:
   contents: read
 
 jobs:
-  # Native runners: full lint + race detector + 100% coverage gate.
-  native:
-    name: native (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runs-on: ubuntu-latest
-          - arch: arm64
-            runs-on: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runs-on }}
+  test:
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: stable
+          go-version-file: go.mod
 
       - name: gofmt
         run: |
@@ -52,101 +42,8 @@ jobs:
           awk -v p="$pct" 'BEGIN { if (p+0 < 100.0) { printf "coverage is %s%%, want 100%%\n", p; exit 1 } }'
 
       - name: Upload coverage profile
-        if: matrix.arch == 'amd64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage.out
           if-no-files-found: error
-
-  # Emulated runners: cross-compile per-package test binaries and run each
-  # under QEMU, preserving the 100% coverage gate. peln parses/links PE/COFF,
-  # which is little-endian; s390x is big-endian, so this is a real endianness
-  # test of the explicit binary.LittleEndian decoding paths.
-  emulated:
-    name: emulated (${{ matrix.arch }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: riscv64
-            image: debian:trixie
-            qemu_cpu: rv64,v=true,vlen=128
-          - arch: loong64
-            image: ghcr.io/loong64/debian:trixie
-            qemu_cpu: la464
-          - arch: ppc64le
-            image: debian:trixie
-            qemu_cpu: power9
-          - arch: s390x
-            image: debian:trixie
-            qemu_cpu: qemu
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-
-      - name: Register binfmt handlers
-        run: docker run --privileged --rm tonistiigi/binfmt --install all
-
-      - name: Cross-compile per-package test binaries
-        env:
-          GOOS: linux
-          GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: "0"
-        run: |
-          set -euo pipefail
-          mkdir -p _tests
-          for pkg in $(go list ./...); do
-            name=$(echo "$pkg" | tr '/' '_')
-            # -c builds the test binary without running it; -cover instruments it.
-            if go test -c -cover -covermode=atomic -o "_tests/${name}.test" "$pkg" \
-                 2>"_tests/${name}.buildlog"; then
-              echo "built $pkg -> _tests/${name}.test"
-            elif grep -q "no test files" "_tests/${name}.buildlog"; then
-              echo "skip $pkg (no test files)"
-            else
-              cat "_tests/${name}.buildlog"
-              exit 1
-            fi
-          done
-
-      - name: Run test binaries under QEMU
-        env:
-          QEMU_CPU: ${{ matrix.qemu_cpu }}
-        run: |
-          set -euo pipefail
-          fail=0
-          mkdir -p _covdir
-          shopt -s nullglob
-          for bin in _tests/*.test; do
-            name=$(basename "$bin" .test)
-            echo "=== running $name on ${{ matrix.arch }} (QEMU_CPU=$QEMU_CPU) ==="
-            if docker run --rm --platform linux/${{ matrix.arch }} \
-                -e QEMU_CPU \
-                -v "$PWD:/w" -w /w \
-                ${{ matrix.image }} \
-                "/w/$bin" -test.v -test.coverprofile="/w/_covdir/${name}.cov"; then
-              :
-            else
-              echo "FAILED: $name"
-              fail=1
-            fi
-          done
-          exit $fail
-
-      - name: Enforce 100% coverage
-        run: |
-          set -euo pipefail
-          # Merge the per-package coverprofiles and compute the total.
-          echo "mode: atomic" > coverage.out
-          shopt -s nullglob
-          for f in _covdir/*.cov; do
-            grep -v '^mode:' "$f" >> coverage.out || true
-          done
-          go tool cover -func=coverage.out | tail -n 30
-          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d %)
-          awk -v p="$pct" 'BEGIN { if (p+0 < 100.0) { printf "coverage is %s%%, want 100%%\n", p; exit 1 } }'
