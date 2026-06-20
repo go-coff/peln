@@ -133,3 +133,26 @@ func TestApplyAMD64_UnsupportedType(t *testing.T) {
 		t.Errorf("expected unsupported-type error, got %v", err)
 	}
 }
+
+// TestApplyAMD64_ShortPatchBytes verifies that a relocation whose patch bytes
+// run past the section end returns an error instead of panicking with an
+// out-of-range slice read (the audit's COFF/AMD64 DoS vector).
+func TestApplyAMD64_ShortPatchBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		typ  uint16
+		n    int // one byte short of what the type needs
+	}{
+		{"ADDR64", relAMD64Addr64, 7},
+		{"ADDR32", relAMD64Addr32, 3},
+		{"ADDR32NB", relAMD64Addr32NB, 3},
+		{"REL32", relAMD64Rel32, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := applyAMD64(c.typ, make([]byte, c.n), 0x1000, 0x2000, 0, 0x10000); err == nil {
+				t.Fatalf("%s: expected error for %d-byte patch, got nil", c.name, c.n)
+			}
+		})
+	}
+}

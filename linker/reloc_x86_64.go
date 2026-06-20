@@ -50,18 +50,27 @@ func applyAMD64(t uint16, patchBytes []byte, patchVA, targetVA uint64, patchRVA 
 
 	case relAMD64Addr64:
 		// 64-bit absolute VA = targetVA + addend.
+		if len(patchBytes) < 8 {
+			return nil, fmt.Errorf("AMD64 ADDR64 needs 8 bytes, have %d", len(patchBytes))
+		}
 		addend := rd64(patchBytes)
 		wr64(patchBytes, targetVA+addend)
 		return []BaseReloc{{RVA: patchRVA, Type: BaseRelocDir64}}, nil
 
 	case relAMD64Addr32:
 		// 32-bit VA = (targetVA + addend) truncated to 32.
+		if len(patchBytes) < 4 {
+			return nil, fmt.Errorf("AMD64 ADDR32 needs 4 bytes, have %d", len(patchBytes))
+		}
 		addend := uint64(rd32(patchBytes))
 		wr32(patchBytes, uint32(targetVA+addend))
 		return []BaseReloc{{RVA: patchRVA, Type: BaseRelocHighLow}}, nil
 
 	case relAMD64Addr32NB:
 		// 32-bit RVA — image-base independent, no .reloc entry.
+		if len(patchBytes) < 4 {
+			return nil, fmt.Errorf("AMD64 ADDR32NB needs 4 bytes, have %d", len(patchBytes))
+		}
 		addend := rd32(patchBytes)
 		wr32(patchBytes, uint32(targetVA-imageBase)+addend)
 		return nil, nil
@@ -86,6 +95,9 @@ func applyAMD64(t uint16, patchBytes []byte, patchVA, targetVA uint64, patchRVA 
 			extraAddend = 8
 		case relAMD64Rel32_5:
 			extraAddend = 9
+		}
+		if len(patchBytes) < 4 {
+			return nil, fmt.Errorf("AMD64 REL32 needs 4 bytes, have %d", len(patchBytes))
 		}
 		fileAddend := int32(rd32(patchBytes))
 		disp := int64(targetVA) - int64(patchVA) - int64(extraAddend) + int64(fileAddend)
