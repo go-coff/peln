@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-coff/brand/main/social/go-coff.png" alt="go-coff/peln" width="720"></p>
+
 # go-coff/peln
 
 [![CI](https://github.com/go-coff/peln/actions/workflows/ci.yml/badge.svg)](https://github.com/go-coff/peln/actions/workflows/ci.yml)
