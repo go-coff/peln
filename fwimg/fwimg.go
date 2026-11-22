@@ -1,6 +1,12 @@
 // Package fwimg produces bare-metal / firmware images in pure Go, with no
 // dependency on binutils (objcopy), srec_cat or U-Boot's mkimage.
 //
+// Deprecated: use github.com/go-binfmt/fwimg. This copy is frozen: it
+// allocates the whole address span between segments, does not check segment
+// ranges against the input, and wraps or truncates past 4 GiB, all of which
+// the new module refuses (its Flatten takes the input size, and SREC, IHEX and
+// UImage return errors).
+//
 // It complements go-coff/peln/linker (which targets UEFI PE32+/EFI) with
 // the non-UEFI output formats a flat-loaded bare-metal target needs:
 //
